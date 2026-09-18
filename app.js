@@ -1,4 +1,6 @@
-import { MotionTracker, DEFAULT_SETTINGS, thresholds, resolveThrow } from './motion.js?v=body-2';
+import { MotionTracker, DEFAULT_SETTINGS, thresholds, resolveThrow } from './motion.js?v=board-1';
+import { NODES, DIAGONALS, ZODIAC, EVENT_TYPES, createBoardState, moveOptions, applyMove, stepsFor, autoGenerateEvents } from './board.js?v=board-2';
+const TEAM_COLORS = ['#c96a4d', '#3c6e91', '#7a5ba5', '#4f8f5b', '#b98a2e', '#a34d78', '#4f7a7a', '#9a5d3c'];
 const $ = id => document.getElementById(id);
 const tracker = new MotionTracker();
 let page = 'home', mode = 'samson', calibration = null, editing = 'mo', phase = '', round = 1, stream, landmarker, loading = false;
@@ -6,8 +8,12 @@ let settings = { ...DEFAULT_SETTINGS };
 let returnSeconds = 10;
 try { const saved = Number(localStorage.getItem('yut-return-seconds')); if (Number.isInteger(saved) && saved >= 1 && saved <= 30) returnSeconds = saved; } catch {}
 try { const saved = JSON.parse(localStorage.getItem('yut-body-settings-v1')); if (saved && Number.isFinite(saved.fall) && Number.isFinite(saved.mo) && saved.fall >= 1 && saved.mo <= 1000 && saved.mo > saved.fall) settings = saved; } catch {}
-let teams = [], teamTurn = 0;
-try { const saved = JSON.parse(localStorage.getItem('yut-teams-v1')); if (Array.isArray(saved)) teams = saved.filter(t => t && typeof t.name === 'string' && Number.isFinite(t.score)).slice(0, 8); } catch {}
+let teams = [], teamTurn = 0, bonusTurn = false, boardVisible = false, selectedMove = null;
+try { const saved = JSON.parse(localStorage.getItem('yut-teams-v1')); if (Array.isArray(saved)) teams = saved.filter(t => t && typeof t.name === 'string' && Number.isFinite(t.score)).slice(0, 8).map(t => ({ name: t.name, score: t.score, skipNext: false })); } catch {}
+let pieceCount = 4;
+try { const saved = Number(localStorage.getItem('yut-piece-count')); if (Number.isInteger(saved) && saved >= 1 && saved <= 6) pieceCount = saved; } catch {}
+let boardEvents = {};
+try { const saved = JSON.parse(localStorage.getItem('yut-board-events-v1')); if (saved && typeof saved === 'object') boardEvents = saved; } catch {}
 let generation = 0, lastFrame = -1, lastDetection = 0, lastSeen = 0, resultTimer, returnTimer, currentResult;
 const video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
 const sticks = [...document.querySelectorAll('.stick')];
@@ -51,7 +57,7 @@ function updateRoundLabel() { if (page !== 'home') $('round').textContent = cali
 function refreshTeamUI() { renderTeamList(); renderScoreDialog(); updateRoundLabel(); }
 function addTeam(name) {
   if (teams.length >= 8) { $('teamMessage').textContent = '팀은 최대 8개까지 등록할 수 있어요.'; return; }
-  teams.push({ name, score: 0 }); persistTeams(); $('teamMessage').textContent = ''; refreshTeamUI();
+  teams.push({ name, score: 0, skipNext: false }); persistTeams(); $('teamMessage').textContent = ''; refreshTeamUI();
 }
 function removeTeam(i) {
   teams.splice(i, 1); if (teamTurn >= teams.length) teamTurn = 0;
@@ -63,11 +69,132 @@ function setScore(i, value) {
   // Avoid rebuilding the score dialog here: doing so on every keystroke would drop input focus mid-type.
   teams[i].score = value; persistTeams(); renderTeamList(); updateRoundLabel();
 }
-function passTurn() {
+function rotateTeam() {
   if (teams.length < 2) return;
   teamTurn = (teamTurn + 1) % teams.length;
+  if (teams[teamTurn].skipNext) { teams[teamTurn].skipNext = false; teamTurn = (teamTurn + 1) % teams.length; }
+}
+function passTurn() {
+  if (teams.length < 2) return;
+  rotateTeam(); bonusTurn = false;
   if (page === 'result') round++;
   setPage('capture');
+}
+function persistEvents() { try { localStorage.setItem('yut-board-events-v1', JSON.stringify(boardEvents)); } catch {} }
+function renderEventGrid() {
+  const box = $('eventGrid'); box.innerHTML = '';
+  for (let i = 1; i < 20; i++) {
+    if (i % 5 === 0) continue;
+    const row = document.createElement('div'); row.className = 'event-row';
+    const label = document.createElement('span'); label.textContent = `${i}번 칸`;
+    const select = document.createElement('select');
+    const none = document.createElement('option'); none.value = ''; none.textContent = '없음'; select.appendChild(none);
+    Object.entries(EVENT_TYPES).forEach(([key, ev]) => { const opt = document.createElement('option'); opt.value = key; opt.textContent = ev.label; select.appendChild(opt); });
+    select.value = boardEvents[i] || '';
+    select.onchange = () => { if (select.value) boardEvents[i] = select.value; else delete boardEvents[i]; persistEvents(); renderBoard(); };
+    row.append(label, select);
+    box.appendChild(row);
+  }
+}
+function renderToggleButtons() {
+  const relevant = teams.length > 0 && !calibration && (page === 'capture' || page === 'result');
+  const label = boardVisible ? '말판 숨기기 ↓' : '말판 보기 ↑';
+  for (const btn of [$('toggleBoard'), $('toggleBoardResult')]) { btn.hidden = !relevant; btn.textContent = label; }
+}
+function renderBoard() {
+  renderToggleButtons();
+  const show = teams.length > 0 && !calibration && boardVisible && (page === 'capture' || page === 'result');
+  $('boardPanel').hidden = !show;
+  if (!show) return;
+  $('boardTurn').textContent = `${teams[teamTurn % teams.length].name} 차례`;
+  const parts = [];
+  DIAGONALS.forEach(path => {
+    parts.push(`<polyline points="${path.map(p => `${p.x},${p.y}`).join(' ')}" fill="none" stroke="#dfe6d2" stroke-width="2"/>`);
+    path.slice(1, -1).forEach(p => parts.push(`<circle cx="${p.x}" cy="${p.y}" r="5" fill="#eef1e6" stroke="#c7d0ba" stroke-width="1.5"/>`));
+  });
+  parts.push(`<polygon points="${NODES.filter((_, i) => i % 5 === 0).map(p => `${p.x},${p.y}`).join(' ')}" fill="none" stroke="#cbd5bb" stroke-width="2"/>`);
+  NODES.forEach((pos, i) => {
+    const corner = i % 5 === 0;
+    const hasEvent = Boolean(boardEvents[i]);
+    const fill = hasEvent ? '#e7c46b' : corner ? '#52704a' : '#d7ddcb';
+    parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="${corner ? 10 : 6}" fill="${fill}" stroke="#fff" stroke-width="${corner ? 2.5 : 1.5}"/>`);
+  });
+  teams.forEach((team, ti) => {
+    const color = TEAM_COLORS[ti % TEAM_COLORS.length];
+    team.board?.stacks.forEach(stack => {
+      const pos = NODES[stack.progress];
+      const n = stack.ids.length;
+      stack.ids.forEach((pid, k) => {
+        const dx = (k - (n - 1) / 2) * 14;
+        parts.push(`<circle cx="${pos.x + dx}" cy="${pos.y}" r="9" fill="${color}"/><text x="${pos.x + dx}" y="${pos.y + 4}" font-size="11" text-anchor="middle">${ZODIAC[pid % 12].emoji}</text>`);
+      });
+    });
+  });
+  $('boardSvg').innerHTML = parts.join('');
+  renderRoster();
+}
+function renderRoster() {
+  const box = $('boardRoster'); box.innerHTML = '';
+  teams.forEach((team, ti) => {
+    const row = document.createElement('div'); row.className = 'roster-row';
+    const name = document.createElement('b'); name.textContent = team.name; name.style.color = TEAM_COLORS[ti % TEAM_COLORS.length];
+    row.appendChild(name);
+    if (team.board) {
+      team.board.waiting.forEach(id => { const s = document.createElement('span'); s.className = 'roster-piece waiting'; s.textContent = ZODIAC[id % 12].emoji; row.appendChild(s); });
+      team.board.finished.forEach(id => { const s = document.createElement('span'); s.className = 'roster-piece done'; s.textContent = ZODIAC[id % 12].emoji; row.appendChild(s); });
+    }
+    box.appendChild(row);
+  });
+}
+function sameOption(a, b) { return Boolean(a && b) && a.kind === b.kind && (a.kind === 'waiting' ? a.id === b.id : a.index === b.index); }
+function presentMoveOptions() {
+  clearInterval(returnTimer);
+  $('countdown').textContent = '이동할 말을 고르고 완료를 눌러주세요.';
+  const team = teams[teamTurn % teams.length];
+  const options = moveOptions(team.board);
+  selectedMove = options[0] || null;
+  boardVisible = true;
+  $('next').hidden = true;
+  renderMoveOptions(options, team);
+  renderBoard();
+}
+function renderMoveOptions(options, team) {
+  const box = $('moveOptions'); box.innerHTML = '';
+  options.forEach(opt => {
+    const btn = document.createElement('button'); btn.type = 'button';
+    btn.className = sameOption(opt, selectedMove) ? 'primary selected' : 'primary';
+    const id = opt.kind === 'waiting' ? opt.id : team.board.stacks[opt.index].ids[0];
+    const count = opt.kind === 'stack' ? team.board.stacks[opt.index].ids.length : 1;
+    btn.textContent = opt.kind === 'waiting' ? `${ZODIAC[opt.id % 12].emoji} 새 말 출발` : `${ZODIAC[id % 12].emoji} 말 이동${count > 1 ? ` (${count}개)` : ''}`;
+    btn.onclick = () => { selectedMove = opt; renderMoveOptions(options, team); };
+    box.appendChild(btn);
+  });
+  const confirm = document.createElement('button'); confirm.type = 'button'; confirm.className = 'primary confirm-move';
+  confirm.textContent = '완료'; confirm.disabled = !selectedMove;
+  confirm.onclick = () => chooseMove(selectedMove);
+  box.appendChild(confirm);
+}
+function chooseMove(option) {
+  if (!option) return;
+  const steps = stepsFor(currentResult.name);
+  const info = applyMove(teams, teamTurn % teams.length, option, steps, boardEvents);
+  bonusTurn = info.bonusTurn; selectedMove = null;
+  if (info.skipNext) teams[teamTurn % teams.length].skipNext = true;
+  $('moveOptions').innerHTML = ''; $('next').hidden = false;
+  const messages = [];
+  if (info.captured) messages.push('상대 말을 잡았어요!');
+  if (info.event) messages.push(`이벤트: ${info.event.label}`);
+  if (info.finished) messages.push('말이 도착했어요!');
+  if (bonusTurn && !info.teamDone) messages.push('보너스! 한 번 더 던지세요.');
+  if (info.teamDone) messages.push(`${teams[teamTurn % teams.length].name} 완주!`);
+  $('boardMessage').textContent = messages.join(' ');
+  renderBoard();
+  if (info.teamDone) { $('countdown').textContent = `${teams[teamTurn % teams.length].name}이(가) 모든 말을 완주시켰어요!`; return; }
+  startReturnCountdown();
+}
+function startReturnCountdown() {
+  let remaining = returnSeconds; $('countdown').textContent = `${remaining}초 후 모션 인식 화면으로 돌아갑니다.`;
+  returnTimer = setInterval(() => { remaining--; $('countdown').textContent = `${remaining}초 후 모션 인식 화면으로 돌아갑니다.`; if (remaining <= 0) nextRound(); }, 1000);
 }
 function openSettings(key, measured) {
   editing = key; $('settingsTitle').textContent = key === 'mo' ? '모 감도 입력' : '낙 감도 입력';
@@ -75,12 +202,14 @@ function openSettings(key, measured) {
   $('settingsDialog').showModal();
 }
 function home() {
-  generation++; stopCamera(); calibration = null; tracker.reset(); error(); teamTurn = 0;
+  generation++; stopCamera(); calibration = null; tracker.reset(); error(); teamTurn = 0; bonusTurn = false;
   $('placeholder').hidden = false; $('cameraState').textContent = '카메라 대기 중';
   setPage('home'); updateSettings(); renderTeamList();
 }
 function begin(selectedMode) {
-  mode = selectedMode; calibration = null; round = 1; setPage('capture');
+  mode = selectedMode; calibration = null; round = 1; teamTurn = 0; bonusTurn = false;
+  teams.forEach(t => { t.board = createBoardState(pieceCount); t.skipNext = false; });
+  setPage('capture');
 }
 function clearTimers() { clearTimeout(resultTimer); clearInterval(returnTimer); }
 function error(message = '') { $('error').textContent = message; $('error').hidden = !message; }
@@ -109,7 +238,9 @@ function setPage(next) {
     instructions[1].textContent = '손을 허리 아래에 두고 잠깐 멈춰 준비해요.';
     instructions[2].textContent = classic ? '한쪽 팔만 올려도 시작돼요. 세기는 결과에 반영되지 않아요.' : '살짝 앉았다가 몸을 위로 튕기며 손을 어깨 위로 올려요.';
     $('hint').textContent = classic ? '카메라 동작 또는 윷 던지기 버튼으로 시작하세요.' : '카메라 앞에서 손을 내리고 몸통을 잠깐 멈춰주세요.';
+    $('moveOptions').innerHTML = ''; $('boardMessage').textContent = ''; selectedMove = null;
   }
+  renderBoard();
 }
 function stopCamera() { stream?.getTracks().forEach(t => t.stop()); stream = null; video.srcObject = null; ctx.clearRect(0, 0, canvas.width, canvas.height); }
 async function startCamera() {
@@ -197,10 +328,15 @@ function reveal() {
   $('resultTitle').textContent = currentResult.name === '낙' ? '아쉬워요, 낙!' : `${currentResult.name}! 멋지게 던졌어요.`;
   $('resultDetail').textContent = currentResult.reason; $('resultBadge').textContent = currentResult.name; $('resultBadge').hidden = false;
   $('next').textContent = '다음 던지기 →';
-  let remaining = returnSeconds; $('countdown').textContent = `${remaining}초 후 모션 인식 화면으로 돌아갑니다.`;
-  returnTimer = setInterval(() => { remaining--; $('countdown').textContent = `${remaining}초 후 모션 인식 화면으로 돌아갑니다.`; if (remaining <= 0) nextRound(); }, 1000);
+  const canMove = teams.length > 0 && !currentResult.demo && currentResult.name !== '낙';
+  if (canMove) presentMoveOptions(); else { $('moveOptions').innerHTML = ''; startReturnCountdown(); }
 }
-function nextRound() { round++; setPage('capture'); }
+function nextRound() {
+  round++;
+  if (!bonusTurn) rotateTeam();
+  bonusTurn = false;
+  setPage('capture');
+}
 $('start').onclick = startCamera; $('retry').onclick = startCamera;
 $('next').onclick = () => {
   if (page === 'capture' && mode === 'classic') { showThrow(resolveThrow(mode)); return; }
@@ -235,6 +371,18 @@ $('teamForm').onsubmit = event => {
 $('scoreboard').onclick = () => { renderScoreDialog(); $('scoreDialog').showModal(); };
 $('closeScore').onclick = () => $('scoreDialog').close();
 $('passTurn').onclick = passTurn;
+$('pieceCount').value = pieceCount;
+$('pieceForm').onsubmit = event => {
+  event.preventDefault();
+  const value = Number($('pieceCount').value);
+  if (!Number.isInteger(value) || value < 1 || value > 6) { $('pieceMessage').textContent = '1~6 사이의 정수를 입력해주세요.'; return; }
+  pieceCount = value;
+  try { localStorage.setItem('yut-piece-count', String(value)); $('pieceMessage').textContent = `말 ${value}개로 저장했어요. 다음 게임부터 적용됩니다.`; }
+  catch { $('pieceMessage').textContent = `현재 게임에 ${value}개를 적용했어요. 브라우저 저장은 사용할 수 없습니다.`; }
+};
+$('autoEvents').onclick = () => { boardEvents = autoGenerateEvents(boardEvents); persistEvents(); renderEventGrid(); renderBoard(); };
+$('resetEvents').onclick = () => { boardEvents = {}; persistEvents(); renderEventGrid(); renderBoard(); };
+$('toggleBoard').onclick = $('toggleBoardResult').onclick = () => { boardVisible = !boardVisible; renderBoard(); };
 $('measure').onclick = () => { $('settingsDialog').close(); calibration = editing; mode = 'samson'; setPage('capture'); startCamera(); };
 document.addEventListener('visibilitychange', () => tracker.reset());
 window.addEventListener('pagehide', () => { generation++; stopCamera(); landmarker?.close(); });
@@ -247,4 +395,4 @@ $('timingForm').onsubmit = event => {
   try { localStorage.setItem('yut-return-seconds', String(value)); $('timingMessage').textContent = `결과 표시 후 ${value}초 뒤 돌아가도록 저장했어요.`; }
   catch { $('timingMessage').textContent = `현재 게임에 ${value}초를 적용했어요. 브라우저 저장은 사용할 수 없습니다.`; }
 };
-updateSettings(); renderTeamList(); setPage('home'); requestAnimationFrame(frame);
+updateSettings(); renderTeamList(); renderEventGrid(); setPage('home'); requestAnimationFrame(frame);
